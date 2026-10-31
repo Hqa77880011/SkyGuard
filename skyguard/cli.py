@@ -11,11 +11,13 @@ import torch
 from torch.nn import functional as F
 
 from .method import Predictor, bucket, calibrate, features
+from .radio import city, link_state
 
 
 def simulate(seed, slots, condition):
     rng = np.random.default_rng(seed)
-    ap = rng.uniform(0, 1200, (5, 2))
+    ap = np.column_stack([rng.uniform(0, 1200, (5, 2)), np.full(5, 25.)])
+    buildings = city(rng, density=0.65 if condition == "cross_map" else 0.35)
     state, links = [], []
     position = rng.uniform(100, 1100, 2)
     heading = rng.uniform(-np.pi, np.pi)
@@ -39,14 +41,10 @@ def simulate(seed, slots, condition):
         load = np.clip(0.98 * load + 0.02 * rng.uniform(0.1, 0.7, 5) + rng.normal(0, 0.01, 5), 0.05, 0.95)
         if condition == "load_shift" and t >= slots // 2:
             load[0] = 0.95
-        distance = np.sqrt(((ap - position) ** 2).sum(1) + altitude ** 2)
-        sinr = 38 - 22 * np.log10(distance / 30) + shadow - 23 * blockage
-        rate = 20 * np.log2(1 + 10 ** (sinr / 10)) * (1 - load)
-        los = np.clip(1 - distance / 1800 - 0.5 * blockage, 0.05, 0.95)
-        delay = 5 + 70 * load
+        radio = link_state(np.r_[position, altitude], ap, buildings, load, shadow, blockage)
         measured = position + (rng.normal(0, 25, 2) if condition == "position_noise" else 0)
         state.append([*measured, altitude, speed, (heading + np.pi) % (2 * np.pi) - np.pi])
-        links.append(np.stack([sinr, rate, los, load, delay], -1))
+        links.append(radio)
     return np.array(state, np.float32), np.array(links, np.float32)
 
 
@@ -75,6 +73,23 @@ def paths(data, split):
     return files
 
 
+def failure_events(trace, t, horizon, definition, switching=True):
+    """Observed per-AP/horizon critical-packet failure, including handover.
+
+    Prediction targets conservatively assume a switch for every candidate at
+    the first horizon step. Staying has no larger interruption than this
+    target; the oracle may pass the actual candidate switching mask.
+    """
+    future = np.array(trace["link"][t + 1:t + horizon + 1], copy=True)
+    mask = np.broadcast_to(switching, future.shape[1])
+    interruption = definition.get("interruption", 0.3)
+    future[0, :, 1] *= 1 - interruption * mask
+    future[0, :, 4] += 100 * interruption * mask
+    return ((future[:, :, 1] < definition["required_rate"])
+            | (future[:, :, 4] > definition.get("packet_deadline_ms", 80))
+            | (future[:, :, 0] < definition.get("outage_sinr", 0))).T
+
+
 def train(args):
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
@@ -84,6 +99,10 @@ def train(args):
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     best, history = float("inf"), []
+    definition = {"required_rate": args.required_rate,
+                  "packet_deadline_ms": getattr(args, "packet_deadline_ms", 80),
+                  "outage_sinr": getattr(args, "outage_sinr", 0),
+                  "interruption": getattr(args, "interruption", 0.3)}
     for epoch in range(args.epochs):
         scores = {}
         for split, files in [("train", train_paths), ("dev", dev_paths)]:
@@ -101,9 +120,12 @@ def train(args):
                     x = np.concatenate([features(trace, t, args.length) for t in times])
                     y = np.concatenate([trace["link"][t + 1:t + args.horizon + 1, :, 1].T for t in times])
                     rate = torch.as_tensor(y, device=args.device)
+                    target = torch.as_tensor(np.concatenate([
+                        failure_events(trace, t, args.horizon, definition) for t in times]),
+                        dtype=torch.float32, device=args.device)
                     with torch.set_grad_enabled(split == "train"):
                         forecast, logits = net(torch.as_tensor(x, device=args.device))
-                        loss = F.smooth_l1_loss(forecast, rate) + 5 * F.binary_cross_entropy_with_logits(logits, (rate < args.required_rate).float())
+                        loss = F.smooth_l1_loss(forecast, rate) + 5 * F.binary_cross_entropy_with_logits(logits, target)
                         if split == "train":
                             optimizer.zero_grad()
                             loss.backward()
@@ -114,7 +136,7 @@ def train(args):
         if scores["dev"] < best:
             best = scores["dev"]
             torch.save({"model": net.state_dict(), "horizon": args.horizon, "length": args.length,
-                        "required_rate": args.required_rate}, out / "model.pt")
+                        **definition, "failure_target": "deadline_rate_sinr_switch_v1"}, out / "model.pt")
     (out / "history.json").write_text(json.dumps(history, indent=2, allow_nan=False))
 
 
@@ -133,7 +155,7 @@ def initial_scores(net, args, saved, grouped):
                 rate, probability = forecast(net, trace, t, saved, args.device)
                 truth = trace["link"][t + 1:t + saved["horizon"] + 1, :, 1].T
                 g = bucket(trace["state"][t]) if grouped else 0
-                pair = (float(abs(rate - truth).max()), float(((truth < saved["required_rate"]) - probability).max()))
+                pair = (float(abs(rate - truth).max()), float((failure_events(trace, t, saved["horizon"], saved) - probability).max()))
                 per_group.setdefault(g, []).append(pair)
             for g, values in per_group.items():
                 buffers[g].append(tuple(np.max(values, axis=0)))
@@ -154,7 +176,7 @@ def control_trace(net, trace, args, saved, original):
         while pending and pending[0][0] <= t:
             end, g, r, p, start = pending.pop(0)
             truth = trace["link"][start + 1:end + 1, :, 1].T
-            pair = (float(abs(r - truth).max()), float(((truth < saved["required_rate"]) - p).max()))
+            pair = (float(abs(r - truth).max()), float((failure_events(trace, start, H, saved) - p).max()))
             if args.method == "full" and not args.no_update:
                 buffers[g].append(pair)
                 buffers[g] = buffers[g][-args.window:]
@@ -179,7 +201,7 @@ def control_trace(net, trace, args, saved, original):
         pending.append((t + H, g, rate, probability, t))
         if args.method == "oracle":
             lower = trace["link"][t + 1:t + H + 1, :, 1].T
-            upper = (lower < saved["required_rate"]).astype(float)
+            upper = failure_events(trace, t, H, saved, np.arange(len(lower)) != serving).astype(float)
         risk = upper.sum(1).clip(0, 1)
         discount = args.discount ** np.arange(H)
         utility = lower @ discount - args.risk_weight * (upper @ discount)
@@ -206,7 +228,7 @@ def control_trace(net, trace, args, saved, original):
             counter = 0
         interruption = args.interruption if switched else 0
         actual_rate = float(trace["link"][t + 1, serving, 1]) * (1 - interruption)
-        deadline_miss = bool(actual_rate < saved["required_rate"] or trace["link"][t + 1, serving, 4] + 100 * interruption > args.packet_deadline_ms)
+        deadline_miss = bool(actual_rate < saved["required_rate"] or trace["link"][t + 1, serving, 4] + 100 * interruption > saved.get("packet_deadline_ms", args.packet_deadline_ms) or trace["link"][t + 1, serving, 0] < saved.get("outage_sinr", args.outage_sinr))
         truth = trace["link"][t + 1:t + H + 1, :, 1].T
         covered = bool(np.all(np.abs(truth - rate) <= q)) if args.method in {"full", "static"} else None
         rows.append({"slot": t, "serving": serving, "rate_mbps": actual_rate, "miss": deadline_miss,
@@ -234,6 +256,10 @@ def control_trace(net, trace, args, saved, original):
 
 def evaluate(args):
     saved = torch.load(args.checkpoint, map_location=args.device, weights_only=True)
+    if saved.get("failure_target") != "deadline_rate_sinr_switch_v1":
+        raise ValueError("Checkpoint predates the full packet-failure target; retrain with the current training entry")
+    for key in ("packet_deadline_ms", "outage_sinr", "interruption"):
+        setattr(args, key, saved[key])
     net = Predictor(saved["horizon"]).to(args.device)
     net.load_state_dict(saved["model"])
     net.eval()
@@ -242,7 +268,7 @@ def evaluate(args):
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     summaries = []
-    for path in paths(args.data, "test"):
+    for path in paths(args.data, getattr(args, "split", "test")):
         metrics, rows = control_trace(net, np.load(path), args, saved, buffers)
         summaries.append({"trace": path.stem, **metrics})
         (out / f"{path.stem}.json").write_text(json.dumps(rows, indent=2, allow_nan=False))
@@ -286,6 +312,9 @@ def main():
                 p.add_argument("--" + key, type=int, default=value)
             p.add_argument("--lr", type=float, default=1e-3)
             p.add_argument("--required-rate", type=float, default=8)
+            p.add_argument("--packet-deadline-ms", type=float, default=80)
+            p.add_argument("--outage-sinr", type=float, default=0)
+            p.add_argument("--interruption", type=float, default=0.3)
             p.set_defaults(function=train)
         else:
             p.add_argument("--checkpoint", default="runs/train/model.pt")

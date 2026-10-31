@@ -8,11 +8,32 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from skyguard.cli import control_trace, evaluate, prepare, train
+from skyguard.cli import control_trace, evaluate, failure_events, prepare, train
 from skyguard.method import Predictor, calibrate, features, quantile
 
 
 class FunctionalTest(unittest.TestCase):
+    def test_building_visibility_geometry(self):
+        from skyguard.radio import visible
+        building = np.array([[[4., -1, 0], [6, 1, 2]]])
+        np.testing.assert_array_equal(visible(np.array([0., 0, 1]),
+                                             np.array([[10., 0, 1], [10., 0, 10]]),
+                                             building), [False, True])
+
+    def test_failure_definition_includes_delay_radio_and_switch(self):
+        trace = {"link": np.zeros((4, 3, 5), dtype=np.float32)}
+        trace["link"][:, :, 1] = 10
+        trace["link"][:, :, 0] = 5
+        trace["link"][1, 0, 4] = 90
+        trace["link"][2, 1, 0] = -1
+        definition = {"required_rate": 8, "packet_deadline_ms": 80,
+                      "outage_sinr": 0, "interruption": .3}
+        events = failure_events(trace, 0, 2, definition)
+        self.assertTrue(events[:, 0].all())
+        self.assertTrue(events[1, 1])
+        self.assertFalse(events[2, 1])
+        self.assertFalse(failure_events(trace, 0, 2, definition, False)[2, 0])
+
     def test_training_checkpoint_and_controls(self):
         torch.set_num_threads(1)
         torch.manual_seed(42)
@@ -69,6 +90,18 @@ class FunctionalTest(unittest.TestCase):
             for flag in ("no_group", "no_update", "no_dwell", "no_risk"):
                 evaluate(SimpleNamespace(**{**options, flag: True}, method="full",
                                          output=root / flag))
+            from skyguard.pipeline import import_traces, tune
+            policy = tune(data, root / "train/model.pt",
+                          {"margin": [1], "trigger": [1], "dwell": [1]},
+                          root / "policy.json")
+            self.assertEqual(policy["selection_split"], "dev")
+            self.assertEqual(len(policy["methods"]), 7)
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps([{"path": "data/test/400_id.npz",
+                                             "seed": 400, "split": "test"}]))
+            import_traces(manifest, root / "imported")
+            with np.load(root / "imported/test/400_measured.npz") as imported:
+                np.testing.assert_array_equal(imported["link"], trace["link"])
 
     def test_quantiles_and_hand_computed_metrics(self):
         self.assertEqual(quantile([1, 2, 3], 0.5), 2)

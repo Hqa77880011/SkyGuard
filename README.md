@@ -10,7 +10,7 @@ Requires Python `>=3.10`. Run from the repository root in an activated environme
 python -m pip install -e .
 ```
 
-Validation environment: Python 3.13.5, CPU with one PyTorch thread. Run `python -m unittest discover -s tests -v`: two tests exercise generated NPZ data, one training epoch (seed 42), finite loss, nonzero gradients and parameter updates, exact same-input evaluation after state restoration, all seven controllers, four ablations, JSON aggregation and plots. Quantiles and constant-service metrics are checked against hand-computed values. The tiny generated scenarios are functional checks, not the paper's experimental results. Full training and the reported three-seed study have not been rerun.
+Validation environment: Python 3.13.5, CPU with one PyTorch thread. Run `python -m unittest discover -s tests -v`: four tests exercise generated NPZ data, one training epoch (seed 42), finite loss, nonzero gradients and parameter updates, exact same-input evaluation after state restoration, all seven controllers, four ablations, JSON aggregation and plots. Quantiles and constant-service metrics are checked against hand-computed values. The tiny generated scenarios are functional checks, not the paper's experimental results. Full training and the reported three-seed study have not been rerun.
 
 ## Data and preprocessing
 
@@ -62,4 +62,20 @@ Risk-budget violation uses the empirical frequency of any deadline miss within a
 | Risk union bound, utility, hysteresis/TTT/dwell | `control_trace` | `skyguard evaluate`, delta .05, TTT=3, dwell=12 |
 | All reported metric families and plots | `control_trace`, `evaluate` | `metrics.json`, `summary.json`, `service.png` |
 
-This repository contains an implementation; no original training checkpoint or raw experiment log was available for comparison. The procedural generator uses a log-distance link model and Markov blockage, rather than a verified reconstruction of the paper's building/sector/3GPP simulation. The risk head is trained on `rate < required_rate` as a service-outage proxy; backhaul-delay and switching-interruption deadline failures are included in final metrics but not forecast by this head. Consequently its risk bound is not a certificate for the full measured mission event. Rate calibration uses a conservative maximum over candidate APs and all sampled origins per calibration trajectory; online updates use completed horizons only. The GRU width 48, dropout .15, Huber plus 5×binary-cross-entropy loss, physical feature scales and control weights are explicit implementation choices where a frozen original setting was unavailable. Training/dev/cal/test seeds are disjoint; evaluation outcomes update only the causal online buffer, never predictor weights or tuned thresholds.
+The implementation now trains and calibrates the complete per-horizon critical-packet failure event: required-rate shortfall, backhaul delay, radio outage and first-step switching interruption. Prediction targets conservatively charge the first-step interruption to every candidate; the oracle uses the actual stay/switch mask. Every saved checkpoint binds the event thresholds. Evaluation restores those thresholds, and legacy rate-only checkpoints must be retrained. Future realized outcomes enter the sliding buffer only when their full horizons complete. Main-method dwell exceeds the default horizon; the no-dwell ablation changes that controller contract explicitly.
+
+`radio.py` builds street-separated 3-D buildings, performs exact line-segment/building intersections, evaluates three site sectors, shadowing, load, noise and inter-site interference. The antenna-element pattern is from [TR 38.901 Table 7.3-1](https://www.etsi.org/deliver/etsi_TR/138900_138999/138901/14.02.00_60/tr_138901v140200p.pdf). Log-distance LOS/NLOS coefficients, 10-degree downtilt and physical feature scales are declared scenario choices. Terrestrial standard height applicability is not silently extended to all UAV altitudes: these are procedural sub-6-GHz scenarios, and measured trajectories can be imported through the same data contract. Original simulator seeds, geometry, trained checkpoints and raw paper results were not available; their numerical reproduction is unverified.
+
+## Development selection and measured inputs
+
+All seven controllers use the same margin/TTT/dwell grid, development traces and trained predictor. The objective is development horizon-miss ratio plus .001 times handovers/minute. No test labels enter checkpoint or policy selection.
+
+```bash
+python -m skyguard.pipeline tune --data data/prepared --checkpoint runs/train/model.pt --input configs/tuning.json --output runs/policy.json
+python -m skyguard.pipeline suite --data data/prepared --checkpoint runs/train/model.pt --input runs/policy.json --output runs/comparison
+python -m skyguard.pipeline import --input data/measured_manifest.json --output data/measured
+```
+
+Measured manifest entries contain `path`, `seed` (independent trajectory identity), `split` (train/dev/cal/test) and `condition`. NPZ files contain `state[T,5]` and `link[T,AP,5]` in the feature order stated above. Imports enforce finite arrays, shape agreement and split-disjoint identities. The suite writes every method's full metric families, per-condition mean/sample-standard-deviation summaries and a mission-risk comparison plot. Existing CLI flags implement no-group/no-update/no-dwell/no-risk ablations on the identical prepared inputs.
+
+Actual extended CPU checks include full deadline target cases, exact geometry occlusion, one-epoch loss/backward/all-parameter updates, same-input checkpoint equality, development-grid selection for seven methods, measured-schema import, all seven controllers and all four ablations. These checks use small generated traces; full training, full radio-field calibration and hardware decision-latency validation have not been run.
