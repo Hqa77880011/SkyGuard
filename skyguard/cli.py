@@ -92,6 +92,8 @@ def train(args):
             for file in files:
                 trace = np.load(file)
                 indices = np.arange(args.length - 1, len(trace["state"]) - args.horizon)
+                if not len(indices):
+                    raise ValueError(f"Trace {file} needs at least length + horizon slots")
                 if split == "train":
                     indices = rng.permutation(indices)
                 for start in range(0, len(indices), args.batch_size):
@@ -113,7 +115,7 @@ def train(args):
             best = scores["dev"]
             torch.save({"model": net.state_dict(), "horizon": args.horizon, "length": args.length,
                         "required_rate": args.required_rate}, out / "model.pt")
-    (out / "history.json").write_text(json.dumps(history, indent=2))
+    (out / "history.json").write_text(json.dumps(history, indent=2, allow_nan=False))
 
 
 def forecast(net, trace, t, saved, device):
@@ -145,6 +147,8 @@ def control_trace(net, trace, args, saved, original):
     serving, previous, last_switch, target, counter = 0, -1, -args.dwell, -1, 0
     switches, failures, pingpong = 0, 0, 0
     H, L = saved["horizon"], saved["length"]
+    if len(trace["state"]) < L + 2 * H - 1:
+        raise ValueError("Evaluation needs length + 2 * horizon - 1 slots for horizon metrics")
     for t in range(L - 1, len(trace["state"]) - H):
         begin = perf_counter()
         while pending and pending[0][0] <= t:
@@ -243,6 +247,20 @@ def evaluate(args):
         summaries.append({"trace": path.stem, **metrics})
         (out / f"{path.stem}.json").write_text(json.dumps(rows, indent=2, allow_nan=False))
     (out / "metrics.json").write_text(json.dumps(summaries, indent=2, allow_nan=False))
+    aggregate = {}
+    for condition in sorted({r["trace"].split("_", 1)[1] for r in summaries}):
+        group = [r for r in summaries if r["trace"].split("_", 1)[1] == condition]
+        aggregate[condition] = {}
+        for key in group[0]:
+            if key == "trace":
+                continue
+            values = [r[key] for r in group if r[key] is not None]
+            aggregate[condition][key] = {
+                "mean": float(np.mean(values)) if values else None,
+                "std": float(np.std(values, ddof=1)) if len(values) > 1 else None,
+                "seeds_with_value": len(values),
+            }
+    (out / "summary.json").write_text(json.dumps(aggregate, indent=2, allow_nan=False))
     fig, ax = plt.subplots(figsize=(8, 3))
     ax.plot([r["slot"] * 0.1 for r in rows], [r["rate_mbps"] for r in rows])
     ax.set(xlabel="Time (s)", ylabel="Delivered service (Mbps)")
