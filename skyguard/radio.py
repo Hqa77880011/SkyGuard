@@ -1,8 +1,7 @@
 """Procedural geometry and declared sub-6 GHz urban link equations.
 
-The antenna element pattern follows TR 38.901 Table 7.3-1. The explicit
-log-distance path-loss coefficients are scenario inputs; this is not a claim
-that terrestrial TR 38.901 height applicability extends to every UAV height.
+The antenna element pattern follows TR 38.901 Table 7.3-1. Log-distance
+path-loss coefficients and height ranges are configured scenario inputs.
 """
 import numpy as np
 

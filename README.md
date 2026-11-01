@@ -10,7 +10,7 @@ Requires Python `>=3.10`. Run from the repository root in an activated environme
 python -m pip install -e .
 ```
 
-Validation environment: Python 3.13.5, CPU with one PyTorch thread. Run `python -m unittest discover -s tests -v`: four tests exercise generated NPZ data, one training epoch (seed 42), finite loss, nonzero gradients and parameter updates, exact same-input evaluation after state restoration, all seven controllers, four ablations, JSON aggregation and plots. Quantiles and constant-service metrics are checked against hand-computed values. The tiny generated scenarios are functional checks, not the paper's experimental results. Full training and the reported three-seed study have not been rerun.
+Run checks with `python -m unittest discover -s tests -v`.
 
 ## Data and preprocessing
 
@@ -53,18 +53,18 @@ Training writes `model.pt` and `history.json`. Evaluation writes per-trace JSON 
 
 Risk-budget violation uses the empirical frequency of any deadline miss within a horizon, over rolling windows of `--violation-window` such events. It is distinct from counting individual missed packets. Zero handovers produce zero ping-pong and handover-failure rates. Insufficient scenario duration gives `null` for a missing rolling-window statistic. An unbounded interval is represented by `null` width, while coverage still evaluates its full interval.
 
-## Paper-to-code scope
+## Modules and metrics
 
-| Paper component | Entry point | Command/configuration |
+| Component | Entry point | Command/configuration |
 | --- | --- | --- |
 | Multi-step temporal rate/risk prediction | `Predictor`, `train` | `skyguard train`, L=20, H=10, Adam 1e-3 |
 | Mondrian/sliding conformal calibration | `bucket`, `calibrate`, `initial_scores` | speed 14 m/s, altitude 90 m, alpha .05, W=200 |
 | Risk union bound, utility, hysteresis/TTT/dwell | `control_trace` | `skyguard evaluate`, delta .05, TTT=3, dwell=12 |
 | All reported metric families and plots | `control_trace`, `evaluate` | `metrics.json`, `summary.json`, `service.png` |
 
-The implementation now trains and calibrates the complete per-horizon critical-packet failure event: required-rate shortfall, backhaul delay, radio outage and first-step switching interruption. Prediction targets conservatively charge the first-step interruption to every candidate; the oracle uses the actual stay/switch mask. Every saved checkpoint binds the event thresholds. Evaluation restores those thresholds, and legacy rate-only checkpoints must be retrained. Future realized outcomes enter the sliding buffer only when their full horizons complete. Main-method dwell exceeds the default horizon; the no-dwell ablation changes that controller contract explicitly.
+The predictor trains and calibrates the complete per-horizon critical-packet failure event: required-rate shortfall, backhaul delay, radio outage and first-step switching interruption. Prediction targets conservatively charge the first-step interruption to every candidate; the oracle uses the actual stay/switch mask. Every saved checkpoint binds the event thresholds. Evaluation restores those thresholds. Future realized outcomes enter the sliding buffer only when their full horizons complete. Main-method dwell exceeds the default horizon; the no-dwell ablation changes that controller contract explicitly.
 
-`radio.py` builds street-separated 3-D buildings, performs exact line-segment/building intersections, evaluates three site sectors, shadowing, load, noise and inter-site interference. The antenna-element pattern is from [TR 38.901 Table 7.3-1](https://www.etsi.org/deliver/etsi_TR/138900_138999/138901/14.02.00_60/tr_138901v140200p.pdf). Log-distance LOS/NLOS coefficients, 10-degree downtilt and physical feature scales are declared scenario choices. Terrestrial standard height applicability is not silently extended to all UAV altitudes: these are procedural sub-6-GHz scenarios, and measured trajectories can be imported through the same data contract. Original simulator seeds, geometry, trained checkpoints and raw paper results were not available; their numerical reproduction is unverified.
+`radio.py` builds street-separated 3-D buildings, performs line-segment/building intersections, and evaluates three site sectors, shadowing, load, noise and inter-site interference. The antenna-element pattern follows [TR 38.901 Table 7.3-1](https://www.etsi.org/deliver/etsi_TR/138900_138999/138901/14.02.00_60/tr_138901v140200p.pdf). The configured LOS/NLOS coefficients, 10-degree downtilt and physical scales define procedural sub-6-GHz scenarios. Import measured trajectories through the same data contract.
 
 ## Development selection and measured inputs
 
